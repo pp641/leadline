@@ -1,0 +1,6 @@
+.env
+*.csv
+!backend/testdata/*.csv
+data/
+node_modules/
+.next/

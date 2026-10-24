@@ -1,0 +1,97 @@
+# Local / single-host deployment. `docker compose up -d` starts everything.
+#   App:      http://localhost:3000
+#   API:      http://localhost:8080   (also proxied at http://localhost:3000/api)
+#   Mailpit:  http://localhost:8025   (catches every email sent in development)
+name: leadline
+
+# Backend settings come from .env via env_file (not ${VAR} interpolation), so
+# variables exported in your shell (e.g. another project's SMTP_HOST) can't
+# silently override them. Only container-topology values are set here.
+x-backend: &backend
+  env_file:
+    - path: .env
+      required: true
+  environment:
+    DATABASE_URL: postgres://${POSTGRES_USER:-leadline}:${POSTGRES_PASSWORD:-leadline}@postgres:5432/${POSTGRES_DB:-leadline}?sslmode=disable
+    REDIS_URL: redis://redis:6379/0
+    STORAGE_DIR: /data/uploads
+    TRUST_PROXY: "true"
+  volumes: [uploads:/data/uploads]
+  # "company-data" reaches the company-scraper database (SCRAPER_DATABASE_URL).
+  networks: [default, company-data]
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-leadline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-leadline}
+      POSTGRES_DB: ${POSTGRES_DB:-leadline}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      retries: 20
+
+  redis:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports: ["${MAILPIT_PORT:-8025}:8025"]
+
+  backend:
+    build: ./backend
+    image: leadline-backend
+    restart: unless-stopped
+    <<: *backend
+    ports: ["${API_PORT:-8080}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
+      interval: 10s
+      retries: 10
+
+  worker:
+    image: leadline-backend
+    command: ["/app/worker"]
+    restart: unless-stopped
+    <<: *backend
+    depends_on:
+      backend: { condition: service_healthy }
+    deploy:
+      replicas: ${WORKER_REPLICAS:-1}
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        API_INTERNAL_URL: http://backend:8080
+        # MOCK_MODE=true in .env builds the frontend in demo mode (no backend calls).
+        NEXT_PUBLIC_MOCK_MODE: ${MOCK_MODE:-true}
+    restart: unless-stopped
+    ports: ["${FRONTEND_PORT:-3000}:3000"]
+    depends_on:
+      backend: { condition: service_healthy }
+
+networks:
+  # Shared with company-scraper; `make up` creates it if missing.
+  company-data:
+    external: true
+    name: company-data
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:

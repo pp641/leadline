@@ -1,0 +1,1554 @@
+openapi: 3.1.0
+info:
+  title: Leadline API
+  version: 2.0.0
+  description: |
+    REST API for lead management and compliant outbound email campaigns (Milestone 1).
+
+    **Envelope.** Every JSON response is `{"data": …, "error": null | {code, message, fields?, request_id}, "meta": {…}}`.
+    List endpoints put pagination in `meta` (`total`, `page`, `per_page`).
+
+    **Auth.** `POST /auth/login` returns a short-lived access token (send as `Authorization: Bearer …`) and sets an
+    httpOnly `ll_refresh` cookie. `POST /auth/refresh` rotates it (requires `X-Requested-With`).
+
+    **API keys.** `Authorization: Bearer ll_…` (created under /api-keys) authenticates as the key's organization and role;
+    X-Organization-ID is then optional and must match if sent. API keys cannot call user routes (/auth/*, /organizations).
+
+    **Agency mode.** Members of an agency organization automatically have access to its client organizations
+    (agency owners act as client admins); select a client with X-Organization-ID.
+
+    **Tenancy.** Organization-scoped endpoints require `X-Organization-ID`. The caller must be a member;
+    the minimum role is listed on each operation (`viewer` < `member` < `admin` < `owner`).
+servers:
+  - url: /api/v1
+security:
+  - bearer: []
+  - apiKey: []
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+    apiKey: { type: http, scheme: bearer, bearerFormat: "ll_<prefix>_<secret>", description: Organization API key }
+  parameters:
+    Org:
+      name: X-Organization-ID
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Page: { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+    PerPage: { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+  responses:
+    Error:
+      description: Error envelope. 401 unauthenticated, 403 forbidden, 404 not found, 409 conflict, 422 validation, 429 rate limited.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NoContent: { description: No content }
+  schemas:
+    PipelineInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        stages:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              name: { type: string }
+              probability: { type: integer, minimum: 0, maximum: 100 }
+              kind: { type: string, enum: [open, won, lost] }
+              stale_days: { type: integer, nullable: true }
+    DealInput:
+      type: object
+      properties:
+        pipeline_id: { type: string, format: uuid }
+        stage_id: { type: string, format: uuid }
+        lead_id: { type: string, format: uuid }
+        name: { type: string }
+        value: { type: number, minimum: 0 }
+        currency: { type: string, default: INR }
+        expected_close: { type: string, format: date }
+        owner_id: { type: string, format: uuid }
+        next_step: { type: string }
+        next_step_at: { type: string, format: date-time }
+    WorkflowInput:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        enabled: { type: boolean }
+        template: { type: string }
+        trigger: { type: string, enum: [reply.classified, deal.created, deal.stage_changed, deal.won, deal.lost, deal.stale, deal.inactive] }
+        trigger_config: { type: object, description: "classifications (reply), to_stage_id / pipeline_id (stage change), days (stale/inactive)" }
+        conditions: { type: array, maxItems: 20, items: { type: object, properties: { field: { type: string }, op: { type: string }, value: {} } } }
+        actions:
+          type: array
+          maxItems: 10
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [create_deal, move_deal, assign_owner, create_task, add_note, add_tag, set_lead_status, stop_sequences, notify, sync_crm] }
+              params: { type: object }
+    ErrorEnvelope:
+      type: object
+      properties:
+        data: { type: "null" }
+        error:
+          type: object
+          properties:
+            code: { type: string, examples: [invalid_request] }
+            message: { type: string }
+            fields: { type: object, additionalProperties: { type: string } }
+            request_id: { type: string }
+        meta: { type: object }
+    PageMeta:
+      type: object
+      properties: { total: { type: integer }, page: { type: integer }, per_page: { type: integer } }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        full_name: { type: string }
+        last_login_at: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+    AuthResult:
+      type: object
+      properties:
+        user: { $ref: "#/components/schemas/User" }
+        access_token: { type: string }
+        expires_at: { type: string, format: date-time }
+    Role: { type: string, enum: [owner, admin, member, viewer] }
+    Organization:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        legal_name: { type: string }
+        physical_address: { type: string, description: Included in every email footer. }
+        daily_send_limit: { type: integer }
+        data_retention_days: { type: [integer, "null"] }
+        role: { $ref: "#/components/schemas/Role" }
+        created_at: { type: string, format: date-time }
+        parent_id: { type: [string, "null"], format: uuid, description: Set on agency client organizations. }
+        is_agency: { type: boolean }
+    Member:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string }
+        full_name: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+    Mailbox:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        from_email: { type: string }
+        from_name: { type: string }
+        reply_to: { type: [string, "null"] }
+        daily_limit: { type: integer }
+        status: { type: string, enum: [active, disabled] }
+        sent_last_24h: { type: integer }
+        smtp_host: { type: string, description: Empty = use the server's EMAIL_PROVIDER. }
+        smtp_port: { type: integer }
+        smtp_username: { type: string }
+        smtp_tls: { type: string, enum: [none, starttls, tls] }
+        has_smtp_password: { type: boolean }
+        imap_host: { type: string }
+        imap_port: { type: integer }
+        imap_username: { type: string }
+        imap_tls: { type: boolean }
+        has_imap_password: { type: boolean }
+        inbox_sync_enabled: { type: boolean }
+        last_synced_at: { type: [string, "null"], format: date-time }
+        sync_error: { type: [string, "null"] }
+    MailboxInput:
+      type: object
+      required: [name, from_email, from_name]
+      properties:
+        name: { type: string }
+        from_email: { type: string, format: email }
+        from_name: { type: string }
+        reply_to: { type: [string, "null"], format: email }
+        daily_limit: { type: integer, minimum: 0, maximum: 10000 }
+        status: { type: string, enum: [active, disabled] }
+        smtp_host: { type: string }
+        smtp_port: { type: integer, default: 587 }
+        smtp_username: { type: string }
+        smtp_password: { type: string, writeOnly: true, description: Empty keeps the stored password. }
+        smtp_tls: { type: string, enum: [none, starttls, tls] }
+        imap_host: { type: string }
+        imap_port: { type: integer, default: 993 }
+        imap_username: { type: string }
+        imap_password: { type: string, writeOnly: true }
+        imap_tls: { type: boolean, default: true }
+        inbox_sync_enabled: { type: boolean }
+    EmailStatus: { type: string, enum: [unverified, valid, invalid, risky, unknown, disposable, role_based] }
+    LeadStatus: { type: string, enum: [new, contacted, replied, interested, qualified, meeting, won, lost, unsubscribed] }
+    Lead:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        company_name: { type: string }
+        website: { type: string }
+        domain: { type: string }
+        industry: { type: string }
+        description: { type: string }
+        country: { type: string }
+        state: { type: string }
+        city: { type: string }
+        address: { type: string }
+        phone: { type: string }
+        business_email: { type: [string, "null"] }
+        linkedin_url: { type: string }
+        social_urls: { type: array, items: { type: string } }
+        employee_count: { type: [integer, "null"] }
+        founded_year: { type: [integer, "null"] }
+        source: { type: string }
+        source_url: { type: string }
+        import_id: { type: [string, "null"], format: uuid }
+        lead_score: { type: integer, minimum: 0, maximum: 100 }
+        status: { $ref: "#/components/schemas/LeadStatus" }
+        owner_id: { type: [string, "null"], format: uuid }
+        owner_name: { type: [string, "null"] }
+        website_quality: { type: string, enum: ["", none, poor, ok, good] }
+        tech_stack: { type: array, items: { type: string } }
+        icp_fit: { type: [integer, "null"], description: 0–100 fit against the default ICP. }
+        enriched_at: { type: [string, "null"], format: date-time }
+        tags: { type: array, items: { type: string } }
+        primary_contact:
+          type: [object, "null"]
+          properties:
+            id: { type: string, format: uuid }
+            first_name: { type: string }
+            last_name: { type: string }
+            email: { type: [string, "null"] }
+            email_status: { $ref: "#/components/schemas/EmailStatus" }
+        latest_campaign: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    LeadInput:
+      type: object
+      required: [company_name]
+      properties:
+        company_name: { type: string, maxLength: 255 }
+        website: { type: string, description: URL or bare domain; normalized. }
+        industry: { type: string }
+        description: { type: string }
+        country: { type: string }
+        state: { type: string }
+        city: { type: string }
+        address: { type: string }
+        phone: { type: string }
+        business_email: { type: string, format: email }
+        linkedin_url: { type: string }
+        social_urls: { type: array, items: { type: string } }
+        employee_count: { type: [integer, "null"] }
+        founded_year: { type: [integer, "null"] }
+        source: { type: string, default: manual }
+        source_url: { type: string }
+        status: { $ref: "#/components/schemas/LeadStatus" }
+        tags: { type: array, items: { type: string }, description: Omit to keep existing tags on update. }
+        contact: { $ref: "#/components/schemas/ContactInput", description: Optional first contact (create only). }
+    LeadFilter:
+      type: object
+      description: Used in bulk actions and campaign audiences. All conditions are ANDed and always scoped to the caller's organization.
+      properties:
+        q: { type: string }
+        industries: { type: array, items: { type: string } }
+        cities: { type: array, items: { type: string } }
+        states: { type: array, items: { type: string } }
+        countries: { type: array, items: { type: string } }
+        statuses: { type: array, items: { $ref: "#/components/schemas/LeadStatus" } }
+        sources: { type: array, items: { type: string } }
+        tags: { type: array, items: { type: string } }
+        email_statuses: { type: array, items: { $ref: "#/components/schemas/EmailStatus" } }
+        min_score: { type: integer }
+        max_score: { type: integer }
+        has_website: { type: boolean }
+        has_email: { type: boolean }
+        import_id: { type: string, format: uuid }
+        campaign_id: { type: string, format: uuid }
+        not_in_campaign_id: { type: string, format: uuid }
+        ids: { type: array, items: { type: string, format: uuid } }
+        owner_id: { type: string, format: uuid }
+        unassigned: { type: boolean }
+        website_quality: { type: array, items: { type: string } }
+        min_icp_fit: { type: integer }
+    Contact:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        lead_id: { type: string, format: uuid }
+        first_name: { type: string }
+        last_name: { type: string }
+        job_title: { type: string }
+        email: { type: [string, "null"] }
+        email_status: { $ref: "#/components/schemas/EmailStatus" }
+        email_verified_at: { type: [string, "null"], format: date-time }
+        verification_details: { type: object }
+        linkedin_url: { type: string }
+        source: { type: string }
+        confidence: { type: number }
+        is_primary: { type: boolean }
+        suppressed: { type: boolean }
+    ContactInput:
+      type: object
+      properties:
+        first_name: { type: string }
+        last_name: { type: string }
+        job_title: { type: string }
+        email: { type: string, format: email }
+        linkedin_url: { type: string }
+        source: { type: string }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        is_primary: { type: boolean }
+    ScoreResult:
+      type: object
+      properties:
+        score: { type: integer }
+        reasons: { type: array, items: { type: string }, examples: [["Business opened recently", "No website"]] }
+        score_version: { type: integer }
+    ScoringRule:
+      type: object
+      required: [field, operator, points, reason]
+      properties:
+        id: { type: string }
+        field:
+          type: string
+          enum: [website, industry, city, state, country, description, source, email_status, tags, employee_count, founded_year, social_count, has_email, has_phone]
+        operator: { type: string, enum: [is_empty, not_empty, eq, in, contains, gte, lte, between, within_years, is_true, is_false] }
+        values: { type: array, items: { type: string } }
+        min: { type: [number, "null"] }
+        max: { type: [number, "null"] }
+        points: { type: integer, minimum: -100, maximum: 100 }
+        reason: { type: string }
+        enabled: { type: boolean }
+    Import:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        filename: { type: string }
+        status: { type: string, enum: [uploaded, previewed, queued, processing, completed, failed] }
+        mapping: { type: object, additionalProperties: { type: string }, description: "CSV column index → field" }
+        headers: { type: array, items: { type: string } }
+        source: { type: string }
+        consent_basis: { type: string, enum: [legitimate_interest, consent, contract, public_business_contact] }
+        total_rows: { type: integer }
+        valid_rows: { type: integer }
+        invalid_rows: { type: integer }
+        duplicate_rows: { type: integer }
+        imported_rows: { type: integer }
+        preview:
+          type: object
+          properties:
+            rows: { type: array, items: { $ref: "#/components/schemas/ImportRow" } }
+            problems: { type: array, items: { $ref: "#/components/schemas/ImportRow" } }
+        error: { type: [string, "null"] }
+    ImportRow:
+      type: object
+      properties:
+        row: { type: integer }
+        values: { type: object, additionalProperties: { type: string } }
+        errors: { type: array, items: { type: string } }
+        duplicate: { type: string }
+    CampaignStatus: { type: string, enum: [draft, scheduled, running, paused, completed, cancelled] }
+    Campaign:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        status: { $ref: "#/components/schemas/CampaignStatus" }
+        mailbox_id: { type: [string, "null"], format: uuid }
+        daily_limit: { type: integer }
+        start_at: { type: [string, "null"], format: date-time }
+        timezone: { type: string, examples: [Asia/Kolkata] }
+        send_window_start: { type: string, examples: ["09:00"] }
+        send_window_end: { type: string, examples: ["17:00"] }
+        send_days: { type: array, items: { type: integer, minimum: 1, maximum: 7 }, description: ISO weekdays (1 = Monday). }
+        allowed_email_statuses: { type: array, items: { $ref: "#/components/schemas/EmailStatus" } }
+        max_bounce_rate: { type: number, description: Auto-pause threshold (0–0.2). }
+        stop_on_reply: { type: boolean }
+        paused_reason: { type: [string, "null"] }
+        launched_at: { type: [string, "null"], format: date-time }
+        completed_at: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+        summary:
+          type: object
+          properties: { leads: { type: integer }, active: { type: integer }, sent: { type: integer }, replied: { type: integer }, bounced: { type: integer } }
+        steps: { type: array, items: { $ref: "#/components/schemas/Step" } }
+    CampaignInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        mailbox_id: { type: [string, "null"], format: uuid }
+        daily_limit: { type: integer, minimum: 1, maximum: 5000, default: 50 }
+        start_at: { type: [string, "null"], format: date-time }
+        timezone: { type: string, default: UTC }
+        send_window_start: { type: string, default: "09:00" }
+        send_window_end: { type: string, default: "17:00" }
+        send_days: { type: array, items: { type: integer }, default: [1, 2, 3, 4, 5] }
+        allowed_email_statuses: { type: array, items: { type: string }, default: [valid] }
+        max_bounce_rate: { type: number, default: 0.05 }
+        stop_on_reply: { type: boolean, default: true }
+        mailbox_ids: { type: array, items: { type: string, format: uuid }, description: Rotate sending across these mailboxes (mailbox_id is included automatically). }
+        ai_personalization: { type: boolean, default: false }
+        personalization_brief: { type: string, description: What you offer — context for the AI opener, never quoted. }
+        require_personalization_approval: { type: boolean, default: true }
+    Step:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        step_number: { type: integer }
+        delay_days: { type: integer, description: Days after the previous step. }
+        subject_template: { type: string, description: "Empty on a follow-up = reply in the same thread (Re: …)." }
+        body_template: { type: string, description: "Plain text with {{variable}} or {{variable|fallback}} placeholders." }
+    StepInput:
+      type: object
+      required: [body_template]
+      properties:
+        delay_days: { type: integer, minimum: 0, maximum: 90 }
+        subject_template: { type: string }
+        body_template: { type: string }
+    CampaignLead:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        lead_id: { type: string, format: uuid }
+        contact_id: { type: [string, "null"], format: uuid }
+        company_name: { type: string }
+        contact_name: { type: string }
+        email: { type: string }
+        email_status: { $ref: "#/components/schemas/EmailStatus" }
+        status: { type: string, enum: [pending, active, sending, completed, replied, bounced, unsubscribed, suppressed, failed, stopped] }
+        next_step_number: { type: integer }
+        next_send_at: { type: [string, "null"], format: date-time }
+        last_sent_at: { type: [string, "null"], format: date-time }
+        stop_reason: { type: [string, "null"] }
+    Metrics:
+      type: object
+      properties:
+        sent: { type: integer }
+        delivered: { type: integer }
+        bounced: { type: integer }
+        complaints: { type: integer }
+        unsubscribed: { type: integer }
+        failed: { type: integer }
+        contacted_leads: { type: integer }
+        replied_leads: { type: integer }
+        positive_replies: { type: integer }
+        delivery_rate: { type: number }
+        bounce_rate: { type: number }
+        reply_rate: { type: number }
+        positive_reply_rate: { type: number }
+        unsubscribe_rate: { type: number }
+    DailyPoint:
+      type: object
+      properties: { date: { type: string, format: date }, sent: { type: integer }, bounced: { type: integer }, replied: { type: integer } }
+    InboundEvent:
+      type: object
+      required: [event_type]
+      properties:
+        message_id: { type: string, description: The RFC Message-ID Leadline generated (without angle brackets). }
+        provider_message_id: { type: string }
+        event_type: { type: string, enum: [delivered, bounced, complained, unsubscribed, replied] }
+        provider_event_id: { type: string, description: Deduplication key. }
+        occurred_at: { type: string, format: date-time }
+        metadata:
+          type: object
+          description: "bounced: {bounce_type: hard|soft}. replied: {classification: positive|interested|question|not_now|not_interested|unsubscribe|wrong_person|out_of_office|spam|unknown}"
+    Suppression:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string }
+        reason: { type: string, enum: [unsubscribed, hard_bounce, complaint, manual, erased] }
+        source: { type: string }
+        campaign_id: { type: [string, "null"], format: uuid }
+        created_at: { type: string, format: date-time }
+
+    ICPCriteria:
+      type: object
+      description: Only criteria that are set count towards the fit score.
+      properties:
+        industries: { type: array, items: { type: string } }
+        countries: { type: array, items: { type: string } }
+        states: { type: array, items: { type: string } }
+        cities: { type: array, items: { type: string } }
+        employees_min: { type: [integer, "null"] }
+        employees_max: { type: [integer, "null"] }
+        founded_after_year: { type: [integer, "null"] }
+        website: { type: string, enum: [any, missing, missing_or_poor, poor, present, good] }
+        keywords: { type: array, items: { type: string } }
+        tech_stack: { type: array, items: { type: string }, examples: [[wordpress, wix]] }
+        buying_signals: { type: array, items: { type: string } }
+        require_social: { type: boolean }
+        require_email: { type: boolean }
+    ICP:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        criteria: { $ref: "#/components/schemas/ICPCriteria" }
+        is_default: { type: boolean, description: The default ICP feeds every lead's icp_fit score. }
+    CatalogQuery:
+      type: object
+      description: Search of the company database. Text lists match case-insensitively; industries also match their singular form.
+      properties:
+        industries: { type: array, items: { type: string } }
+        countries: { type: array, items: { type: string } }
+        states: { type: array, items: { type: string } }
+        cities: { type: array, items: { type: string } }
+        keywords: { type: array, items: { type: string }, description: Matched in name, industry and description. }
+        website: { type: string, enum: [any, missing, missing_or_poor, poor, present, good] }
+        verified_only: { type: boolean }
+        require_email: { type: boolean }
+    CatalogCompany:
+      type: object
+      description: A company collected, website-checked and verified by company-scraper.
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        industry: { type: string }
+        website: { type: string }
+        domain: { type: string }
+        email: { type: [string, "null"] }
+        phone: { type: string }
+        city: { type: string }
+        country: { type: string }
+        source: { type: string, description: "openstreetmap | website" }
+        source_url: { type: string }
+        website_quality: { type: string, enum: ["", none, poor, ok, good] }
+        email_status: { type: string, enum: [valid, invalid, risky, unknown, disposable, role_based, unverified] }
+        verification_status: { type: string, enum: [verified, partial, failed, unverified] }
+    CatalogResult:
+      type: object
+      properties:
+        company: { $ref: "#/components/schemas/CatalogCompany" }
+        duplicate_lead_id: { type: [string, "null"], format: uuid, description: Set when the company already exists as a lead. }
+    InboundMessage:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        lead_id: { type: [string, "null"], format: uuid }
+        company_name: { type: [string, "null"] }
+        campaign_id: { type: [string, "null"], format: uuid }
+        from_email: { type: string }
+        subject: { type: string }
+        body_text: { type: string, description: New text only; quoted history is removed. }
+        received_at: { type: string, format: date-time }
+        kind: { type: string, enum: [reply, auto_reply, bounce] }
+        classification: { type: [string, "null"], enum: [positive, interested, question, not_now, not_interested, unsubscribe, wrong_person, out_of_office, spam, unknown, null] }
+        confidence: { type: [number, "null"] }
+        summary: { type: string }
+        classified_by: { type: string, enum: ["", ai, rules, manual] }
+        status: { type: string, enum: [new, handled, archived] }
+    Task:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        lead_id: { type: [string, "null"], format: uuid }
+        assignee_id: { type: [string, "null"], format: uuid }
+        title: { type: string }
+        notes: { type: string }
+        due_at: { type: [string, "null"], format: date-time }
+        completed_at: { type: [string, "null"], format: date-time }
+    TaskInput:
+      type: object
+      required: [title]
+      properties:
+        lead_id: { type: [string, "null"], format: uuid }
+        assignee_id: { type: [string, "null"], format: uuid, description: Defaults to the caller on create. }
+        title: { type: string }
+        notes: { type: string }
+        due_at: { type: [string, "null"], format: date-time }
+        completed: { type: boolean }
+    Personalization:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        lead_id: { type: string, format: uuid }
+        company_name: { type: string }
+        content: { type: string, description: "One sentence, available to templates as {{personalized_line}}." }
+        status: { type: string, enum: [pending, generated, approved, rejected, failed] }
+        error: { type: [string, "null"] }
+    APIKey:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        prefix: { type: string }
+        role: { type: string, enum: [admin, member, viewer] }
+        last_used_at: { type: [string, "null"], format: date-time }
+        revoked_at: { type: [string, "null"], format: date-time }
+        token: { type: string, description: Plaintext key — returned only by the create call. }
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        description: { type: string }
+        events:
+          type: array
+          items: { type: string, enum: [lead.created, lead.status_changed, email.sent, email.bounced, email.replied, email.unsubscribed, reply.received, campaign.completed, campaign.paused, deal.created, deal.stage_changed, deal.won, deal.lost] }
+        active: { type: boolean }
+        secret: { type: string, description: Signing secret — returned only by the create call. }
+    OutboundEvent:
+      type: object
+      description: |
+        Body POSTed to webhook endpoints. Headers: X-Leadline-Event, X-Leadline-Delivery and
+        X-Leadline-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, "<t>.<raw body>")>. Reject old timestamps.
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string }
+        created_at: { type: string, format: date-time }
+        organization_id: { type: string, format: uuid }
+        data: { type: object }
+    IntegrationInput:
+      type: object
+      properties:
+        secret: { type: string, description: API key / access token; empty keeps the stored one. Stored AES-256-GCM encrypted. }
+        config:
+          type: object
+          description: "hubspot: {auto_sync: bool}"
+        status: { type: string, enum: [active, disabled] }
+
+paths:
+  # ─── Auth ───────────────────────────────────────────
+  /auth/register:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Create an account (rate limited)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, full_name, accept_terms]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 10, maxLength: 72 }
+                full_name: { type: string }
+                accept_terms: { type: boolean, description: "Must be true; the acceptance time is recorded. A verification code is emailed after sign-up." }
+      responses:
+        "201": { description: Created; sets ll_refresh cookie, content: { application/json: { schema: { $ref: "#/components/schemas/AuthResult" } } } }
+        default: { $ref: "#/components/responses/Error" }
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Sign in (rate limited per IP and per email)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [email, password], properties: { email: { type: string }, password: { type: string } } }
+      responses:
+        "200": { description: OK; sets ll_refresh cookie, content: { application/json: { schema: { $ref: "#/components/schemas/AuthResult" } } } }
+        default: { $ref: "#/components/responses/Error" }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Rotate the refresh cookie and get a new access token
+      description: Requires the `X-Requested-With` header (CSRF). Re-using a rotated token revokes all of the user's sessions.
+      parameters:
+        - { name: X-Requested-With, in: header, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/AuthResult" } } } }
+        default: { $ref: "#/components/responses/Error" }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      security: []
+      parameters:
+        - { name: X-Requested-With, in: header, required: true, schema: { type: string } }
+      responses: { "204": { $ref: "#/components/responses/NoContent" } }
+  /auth/me:
+    get:
+      tags: [Auth]
+      responses:
+        "200": { description: Current user, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+
+  # ─── Organizations ──────────────────────────────────
+  /organizations:
+    get:
+      tags: [Organizations]
+      summary: Organizations the caller belongs to (with their role)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Organization" } } } } }
+    post:
+      tags: [Organizations]
+      summary: Create an organization; the caller becomes owner
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [name], properties: { name: { type: string }, legal_name: { type: string }, physical_address: { type: string } } }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Organization" } } } }
+  /organizations/current:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Organizations], summary: "Get (viewer)", responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Organization" } } } } } }
+    patch:
+      tags: [Organizations]
+      summary: Update settings (admin)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                legal_name: { type: string }
+                physical_address: { type: string }
+                daily_send_limit: { type: integer }
+                data_retention_days: { type: [integer, "null"] }
+      responses: { "200": { description: OK } }
+    delete: { tags: [Organizations], summary: "Delete organization and all its data (owner)", responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /organizations/current/members:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Organizations], summary: "List members (viewer)", responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Member" } } } } } } }
+    post:
+      tags: [Organizations]
+      summary: Add an existing user (admin)
+      requestBody:
+        content: { application/json: { schema: { type: object, required: [email, role], properties: { email: { type: string }, role: { $ref: "#/components/schemas/Role" } } } } }
+      responses: { "204": { $ref: "#/components/responses/NoContent" } }
+  /organizations/current/members/{userID}:
+    parameters:
+      - { $ref: "#/components/parameters/Org" }
+      - { name: userID, in: path, required: true, schema: { type: string, format: uuid } }
+    patch:
+      tags: [Organizations]
+      summary: Change role (admin; owner roles need an owner; the last owner cannot be demoted)
+      requestBody: { content: { application/json: { schema: { type: object, properties: { role: { $ref: "#/components/schemas/Role" } } } } } }
+      responses: { "204": { $ref: "#/components/responses/NoContent" } }
+    delete: { tags: [Organizations], summary: "Remove member (admin)", responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /organizations/current/audit-logs:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Page" }, { $ref: "#/components/parameters/PerPage" }]
+    get: { tags: [Organizations], summary: "Audit trail (admin)", responses: { "200": { description: OK } } }
+
+  # ─── Mailboxes ──────────────────────────────────────
+  /mailboxes:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Mailboxes], summary: "List (viewer)", responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Mailbox" } } } } } } }
+    post:
+      tags: [Mailboxes]
+      summary: Create (admin)
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/MailboxInput" } } } }
+      responses: { "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Mailbox" } } } } }
+  /mailboxes/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [Mailboxes]
+      summary: Update (admin)
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/MailboxInput" } } } }
+      responses: { "200": { description: OK } }
+    delete: { tags: [Mailboxes], summary: "Delete (admin; refused while used by an active campaign)", responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+
+  # ─── Leads ──────────────────────────────────────────
+  /leads:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get:
+      tags: [Leads]
+      summary: List and filter leads (viewer)
+      parameters:
+        - { $ref: "#/components/parameters/Page" }
+        - { $ref: "#/components/parameters/PerPage" }
+        - { name: q, in: query, schema: { type: string }, description: Company, domain, email or contact name }
+        - { name: industry, in: query, schema: { type: string }, description: Comma-separated, case-insensitive }
+        - { name: city, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+        - { name: country, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: source, in: query, schema: { type: string } }
+        - { name: tag, in: query, schema: { type: string } }
+        - { name: email_status, in: query, schema: { type: string } }
+        - { name: min_score, in: query, schema: { type: integer } }
+        - { name: max_score, in: query, schema: { type: integer } }
+        - { name: has_website, in: query, schema: { type: boolean } }
+        - { name: has_email, in: query, schema: { type: boolean } }
+        - { name: import_id, in: query, schema: { type: string, format: uuid } }
+        - { name: campaign_id, in: query, schema: { type: string, format: uuid } }
+        - { name: not_in_campaign_id, in: query, schema: { type: string, format: uuid } }
+        - { name: owner_id, in: query, schema: { type: string, format: uuid } }
+        - { name: owner, in: query, schema: { type: string, enum: [none] }, description: "none = unassigned" }
+        - { name: website_quality, in: query, schema: { type: string } }
+        - { name: min_icp_fit, in: query, schema: { type: integer } }
+        - { name: sort, in: query, schema: { type: string, enum: [score, -score, company_name, -company_name, created_at, -created_at, -icp_fit] } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Lead" } }
+                  meta: { $ref: "#/components/schemas/PageMeta" }
+    post:
+      tags: [Leads]
+      summary: Create a lead (member); scored immediately, contact email verified in the background
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/LeadInput" } } } }
+      responses: { "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Lead" } } } } }
+  /leads/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get:
+      tags: [Leads]
+      summary: Lead with contacts and score breakdown (viewer)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Lead"
+                  - type: object
+                    properties:
+                      contacts: { type: array, items: { $ref: "#/components/schemas/Contact" } }
+                      score: { $ref: "#/components/schemas/ScoreResult" }
+    put:
+      tags: [Leads]
+      summary: Replace a lead's fields (member)
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/LeadInput" } } } }
+      responses: { "200": { description: OK } }
+    delete: { tags: [Leads], summary: "Delete a lead and its history (member)", responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /leads/{id}/events:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Leads], summary: "Activity timeline (viewer)", responses: { "200": { description: OK } } }
+  /leads/facets:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get:
+      tags: [Leads]
+      summary: Most common values for filter dropdowns (viewer)
+      parameters: [{ name: field, in: query, required: true, schema: { type: string, enum: [industry, city, state, country, source, tag] } }]
+      responses: { "200": { description: "[{value, count}]" } }
+  /leads/bulk:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    post:
+      tags: [Leads]
+      summary: Bulk action on selected or all matching leads (member; delete needs admin)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [delete, add_tags, remove_tags, set_status, rescore] }
+                ids: { type: array, items: { type: string, format: uuid } }
+                filter: { $ref: "#/components/schemas/LeadFilter" }
+                tags: { type: array, items: { type: string } }
+                status: { $ref: "#/components/schemas/LeadStatus" }
+      responses: { "200": { description: "{affected}" } }
+  /leads/export:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get:
+      tags: [Leads]
+      summary: Export matching leads as CSV (member). Accepts the same filters as GET /leads plus `ids`.
+      responses: { "200": { description: CSV file, content: { text/csv: { schema: { type: string } } } } }
+
+  # ─── Contacts & verification ────────────────────────
+  /leads/{id}/contacts:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Contacts], summary: "List (viewer)", responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Contact" } } } } } } }
+    post:
+      tags: [Contacts]
+      summary: Add a contact (member); email verification is queued
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/ContactInput" } } } }
+      responses: { "201": { description: Created } }
+  /contacts/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Contacts], responses: { "200": { description: OK } } }
+    put:
+      tags: [Contacts]
+      summary: Update (member); a changed email is re-verified
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/ContactInput" } } } }
+      responses: { "200": { description: OK } }
+    delete: { tags: [Contacts], responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /contacts/verify:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    post:
+      tags: [Contacts]
+      summary: Queue email verification (member)
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { contact_ids: { type: array, items: { type: string, format: uuid } }, all_unverified: { type: boolean } } }
+      responses: { "202": { description: "{queued}" } }
+
+  # ─── Scoring ────────────────────────────────────────
+  /scoring:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get:
+      tags: [Scoring]
+      summary: Current scoring rules (viewer); meta lists the allowed fields and operators
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { version: { type: integer }, rules: { type: array, items: { $ref: "#/components/schemas/ScoringRule" } } } } } } }
+    put:
+      tags: [Scoring]
+      summary: Replace rules (admin); bumps the version and rescores all leads in the background
+      requestBody: { content: { application/json: { schema: { type: object, properties: { rules: { type: array, items: { $ref: "#/components/schemas/ScoringRule" } } } } } } }
+      responses: { "200": { description: OK } }
+
+  # ─── Imports ────────────────────────────────────────
+  /imports:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Imports], summary: "Recent imports (viewer)", responses: { "200": { description: OK } } }
+    post:
+      tags: [Imports]
+      summary: Upload a CSV (member) — parses, auto-maps columns, validates, dedupes and returns a preview
+      requestBody:
+        content:
+          multipart/form-data:
+            schema: { type: object, required: [file], properties: { file: { type: string, format: binary, description: "UTF-8 CSV, ≤ 20 MB, ≤ 50,000 rows" } } }
+      responses: { "201": { description: Previewed import, content: { application/json: { schema: { $ref: "#/components/schemas/Import" } } } } }
+  /imports/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Imports], summary: "Status / progress (viewer)", responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Import" } } } } } }
+  /imports/{id}/mapping:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [Imports]
+      summary: Change column mapping / source / lawful basis and re-preview (member)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mapping: { type: object, additionalProperties: { type: string } }
+                source: { type: string }
+                consent_basis: { type: string, enum: [legitimate_interest, consent, contract, public_business_contact] }
+      responses: { "200": { description: OK } }
+  /imports/{id}/commit:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post: { tags: [Imports], summary: "Start the background import (member)", responses: { "202": { description: Queued } } }
+
+  # ─── Campaigns ──────────────────────────────────────
+  /campaigns:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get:
+      tags: [Campaigns]
+      summary: List with summary counts (viewer)
+      parameters: [{ name: status, in: query, schema: { $ref: "#/components/schemas/CampaignStatus" } }, { $ref: "#/components/parameters/Page" }, { $ref: "#/components/parameters/PerPage" }]
+      responses: { "200": { description: OK } }
+    post:
+      tags: [Campaigns]
+      summary: Create a draft (member)
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/CampaignInput" } } } }
+      responses: { "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Campaign" } } } } }
+  /campaigns/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Campaigns], summary: "Campaign with steps (viewer)", responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Campaign" } } } } } }
+    put:
+      tags: [Campaigns]
+      summary: Update settings (member; not when completed/cancelled)
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/CampaignInput" } } } }
+      responses: { "200": { description: OK } }
+    delete: { tags: [Campaigns], summary: "Delete a draft (member)", responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /campaigns/{id}/steps:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Campaigns], summary: "Sequence (viewer); meta lists template variables", responses: { "200": { description: OK } } }
+    put:
+      tags: [Campaigns]
+      summary: Replace the sequence (member; campaign must not be running). Steps already sent cannot be removed.
+      requestBody: { content: { application/json: { schema: { type: object, properties: { steps: { type: array, maxItems: 10, items: { $ref: "#/components/schemas/StepInput" } } } } } } }
+      responses: { "200": { description: OK } }
+  /campaigns/{id}/preview:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post:
+      tags: [Campaigns]
+      summary: Render a step for a lead, optionally with unsaved templates (viewer)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                step_number: { type: integer }
+                lead_id: { type: string, format: uuid }
+                subject_template: { type: string }
+                body_template: { type: string }
+      responses: { "200": { description: "{subject, text, html, empty_variables, to, from, company_name}" } }
+  /campaigns/{id}/leads:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get:
+      tags: [Campaigns]
+      summary: Audience with per-lead sequence status (viewer)
+      parameters: [{ name: status, in: query, schema: { type: string } }, { name: q, in: query, schema: { type: string } }, { $ref: "#/components/parameters/Page" }, { $ref: "#/components/parameters/PerPage" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: "#/components/schemas/CampaignLead" } } } } } } }
+    post:
+      tags: [Campaigns]
+      summary: "Add leads by any mix of picked ids, a filter, an ICP (fit ≥ min_fit) and custom contacts (matched by email or created as new leads). Picks each lead's best contact email; skips suppressed, no-email and already-added leads. dry_run previews the counts (member)"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                lead_ids: { type: array, items: { type: string, format: uuid } }
+                filter: { $ref: "#/components/schemas/LeadFilter" }
+                icp_id: { type: string, format: uuid }
+                min_fit: { type: integer, minimum: 0, maximum: 100, default: 70 }
+                contacts: { type: array, maxItems: 5000, items: { type: object, required: [email], properties: { email: { type: string }, first_name: { type: string }, last_name: { type: string }, company: { type: string } } } }
+                dry_run: { type: boolean }
+      responses: { "200": { description: "{requested, added, skipped, already_in_campaign, no_email, suppressed, created, invalid_emails, dry_run}" } }
+  /campaigns/{id}/leads/remove:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post:
+      tags: [Campaigns]
+      summary: Remove not-yet-emailed leads; stop the rest (member)
+      requestBody: { content: { application/json: { schema: { type: object, properties: { lead_ids: { type: array, items: { type: string, format: uuid } } } } } } }
+      responses: { "200": { description: "{removed}" } }
+  /campaigns/{id}/launch:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post:
+      tags: [Campaigns]
+      summary: Launch a draft (member) → running, or scheduled if start_at is in the future
+      description: Fails with 422 and per-problem `fields` if there are no steps, no audience, no active mailbox, or no organization postal address.
+      responses: { "200": { description: OK } }
+  /campaigns/{id}/pause:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post: { tags: [Campaigns], summary: "Pause (member)", responses: { "200": { description: OK } } }
+  /campaigns/{id}/resume:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post: { tags: [Campaigns], summary: "Resume (member); refused while the bounce rate exceeds the limit", responses: { "200": { description: OK } } }
+  /campaigns/{id}/cancel:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post: { tags: [Campaigns], summary: "Cancel permanently (member); queued emails are cancelled", responses: { "200": { description: OK } } }
+
+  # ─── Email events, webhooks, unsubscribe ────────────
+  /email-events:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get:
+      tags: [Email events]
+      summary: List events (viewer)
+      parameters:
+        - { name: campaign_id, in: query, schema: { type: string, format: uuid } }
+        - { name: lead_id, in: query, schema: { type: string, format: uuid } }
+        - { name: event_type, in: query, schema: { type: string } }
+      responses: { "200": { description: OK } }
+    post:
+      tags: [Email events]
+      summary: Record an event by hand, e.g. a reply received in your own inbox (member)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [campaign_lead_id, event_type]
+              properties:
+                campaign_lead_id: { type: string, format: uuid }
+                event_type: { type: string, enum: [replied, bounced, complained, unsubscribed, delivered] }
+                classification: { type: string }
+                note: { type: string }
+      responses: { "201": { description: Recorded } }
+  /webhooks/email/{provider}:
+    post:
+      tags: [Email events]
+      security: []
+      summary: Provider delivery webhook
+      description: |
+        `generic` provider: body `{"events":[InboundEvent…]}`, header `X-Webhook-Signature` = hex HMAC-SHA256 of the raw
+        body with `WEBHOOK_SECRET`. Duplicate `provider_event_id`s are ignored. Hard bounces and complaints suppress the
+        address; replies stop the sequence.
+      parameters: [{ name: provider, in: path, required: true, schema: { type: string, enum: [generic] } }, { name: X-Webhook-Signature, in: header, required: true, schema: { type: string } }]
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { events: { type: array, items: { $ref: "#/components/schemas/InboundEvent" } } } } } }
+      responses: { "200": { description: "{received, accepted}" } }
+  /public/unsubscribe/{token}:
+    get:
+      tags: [Email events]
+      security: []
+      summary: Unsubscribe confirmation page (HTML)
+      parameters: [{ name: token, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: HTML page } }
+    post:
+      tags: [Email events]
+      security: []
+      summary: Unsubscribe — form submit or RFC 8058 one-click (`List-Unsubscribe=One-Click`)
+      parameters: [{ name: token, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: HTML confirmation } }
+
+  # ─── Suppression & compliance ───────────────────────
+  /suppressions:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get:
+      tags: [Compliance]
+      summary: List (viewer)
+      parameters: [{ name: q, in: query, schema: { type: string } }, { $ref: "#/components/parameters/Page" }, { $ref: "#/components/parameters/PerPage" }]
+      responses: { "200": { description: OK, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: "#/components/schemas/Suppression" } } } } } } } }
+    post:
+      tags: [Compliance]
+      summary: Suppress addresses (member)
+      requestBody: { content: { application/json: { schema: { type: object, properties: { emails: { type: array, items: { type: string } } } } } } }
+      responses: { "201": { description: "{added}" } }
+  /suppressions/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    delete: { tags: [Compliance], summary: "Remove a manual or hard-bounce entry (admin)", responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /compliance/erase:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    post:
+      tags: [Compliance]
+      summary: Erasure request (admin) — deletes contacts, redacts history, keeps a suppression entry
+      requestBody: { content: { application/json: { schema: { type: object, required: [email], properties: { email: { type: string, format: email } } } } } }
+      responses: { "204": { $ref: "#/components/responses/NoContent" } }
+
+  # ─── Analytics ──────────────────────────────────────
+  /analytics/overview:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { name: days, in: query, schema: { type: integer, default: 30, maximum: 365 } }]
+    get:
+      tags: [Analytics]
+      summary: Organization KPIs, period metrics and a daily series (viewer)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_leads: { type: integer }
+                  verified_leads: { type: integer }
+                  active_campaigns: { type: integer }
+                  interested_leads: { type: integer }
+                  meetings: { type: integer }
+                  won: { type: integer }
+                  conversion_rate: { type: number }
+                  period: { $ref: "#/components/schemas/Metrics" }
+                  daily: { type: array, items: { $ref: "#/components/schemas/DailyPoint" } }
+  /analytics/campaigns:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Analytics], summary: "All-time metrics per launched campaign (viewer)", responses: { "200": { description: OK } } }
+  /analytics/campaigns/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Analytics], summary: "Campaign metrics, status funnel, per-step metrics and daily series (viewer)", responses: { "200": { description: OK } } }
+
+  # ═══════════════ Phase 2 & 3 ═══════════════
+
+  # ─── ICPs & company database ────────────────────────
+  /icps:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [ICP], summary: "List ICPs (viewer)", responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/ICP" } } } } } } }
+    post:
+      tags: [ICP]
+      summary: Create (member). The first ICP, or one with is_default, becomes the default and every lead is re-scored.
+      requestBody: { content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string }, is_default: { type: boolean }, criteria: { $ref: "#/components/schemas/ICPCriteria" } } } } } }
+      responses: { "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/ICP" } } } } }
+  /icps/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [ICP], responses: { "200": { description: OK } } }
+    put:
+      tags: [ICP]
+      summary: Update (member); re-scores leads
+      requestBody: { content: { application/json: { schema: { type: object, properties: { name: { type: string }, is_default: { type: boolean }, criteria: { $ref: "#/components/schemas/ICPCriteria" } } } } } }
+      responses: { "200": { description: OK } }
+    delete: { tags: [ICP], responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /catalog/status:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Company database], summary: "Whether the company database (SCRAPER_DATABASE_URL) is configured and reachable (viewer)", responses: { "200": { description: "{configured, reachable}" } } }
+  /sources:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Lead sources], summary: "Importable data providers (Apollo, People Data Labs, Google Places, Crunchbase, Lusha, Hunter, Snov.io) with their search form fields and whether each is connected (viewer)", responses: { "200": { description: OK } } }
+  /sources/{kind}/search:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { name: kind, in: path, required: true, schema: { type: string } }]
+    post:
+      tags: [Lead sources]
+      summary: "Search a connected provider; results are normalized to lead fields (+contacts) and flagged when they duplicate an existing lead (member)"
+      requestBody: { content: { application/json: { schema: { type: object, properties: { params: { type: object, additionalProperties: true } } } } } }
+      responses: { "200": { description: "array of candidates with duplicate_lead_id" }, "409": { description: Provider not connected } }
+  /sources/{kind}/import:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { name: kind, in: path, required: true, schema: { type: string } }]
+    post:
+      tags: [Lead sources]
+      summary: "Import candidates returned by search as leads with contacts, provenance and an enrichment record; duplicates are skipped; verification and scoring follow (member)"
+      requestBody: { content: { application/json: { schema: { type: object, required: [candidates], properties: { candidates: { type: array, maxItems: 500, items: { type: object } }, tags: { type: array, items: { type: string } } } } } } }
+      responses: { "200": { description: "{imported, duplicates, skipped, lead_ids}" } }
+  /catalog/facets:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get:
+      tags: [Company database]
+      summary: "Values present in the company database and the org's leads, for ICP dropdowns: countries (all ISO countries, with counts), states and cities (with parent country/state), industries, tech_stack; company_db=false when only leads could be read (viewer)"
+      responses: { "200": { description: OK } }
+  /catalog/search:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    post:
+      tags: [Company database]
+      summary: Search the company database with an ICP or an ad-hoc query; duplicates of existing leads are flagged (viewer)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                icp_id: { type: string, format: uuid }
+                query: { $ref: "#/components/schemas/CatalogQuery" }
+                verified_only: { type: boolean }
+                limit: { type: integer, maximum: 500, default: 100 }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogResult" } } } } }
+        "409": { description: Company database not configured }
+        "503": { description: Company database unreachable }
+  /catalog/import:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    post:
+      tags: [Company database]
+      summary: Import companies as leads with provenance, website signals and verification report; existing leads are skipped; scoring follows (member)
+      requestBody: { content: { application/json: { schema: { type: object, required: [company_ids], properties: { company_ids: { type: array, maxItems: 500, items: { type: string, format: uuid } }, tags: { type: array, items: { type: string } } } } } } }
+      responses: { "200": { description: "{imported, duplicates, lead_ids}" }, "409": { description: Company database not configured }, "503": { description: Company database unreachable } }
+  /leads/{id}/enrichment:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Company database], summary: "Stored company data by provider: company_db (verification checks, website report); website (leads enriched before the split) (viewer)", responses: { "200": { description: OK } } }
+
+  # ─── AI personalization ─────────────────────────────
+  /campaigns/{id}/personalizations:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }, { name: status, in: query, schema: { type: string } }]
+    get: { tags: [Personalization], summary: "Openers for a campaign; meta.counts by status (viewer)", responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Personalization" } } } } } } }
+  /campaigns/{id}/personalizations/generate:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post:
+      tags: [Personalization]
+      summary: Generate openers for leads without one (regenerate=true redoes all non-approved) (member). 409 when AI is not configured.
+      requestBody: { content: { application/json: { schema: { type: object, properties: { regenerate: { type: boolean } } } } } }
+      responses: { "202": { description: "{queued}" } }
+  /campaigns/{id}/personalizations/approve-all:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post: { tags: [Personalization], summary: "Approve every generated opener (member)", responses: { "200": { description: "{approved}" } } }
+  /personalizations/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [Personalization]
+      summary: Edit and approve/reject one opener (member)
+      requestBody: { content: { application/json: { schema: { type: object, required: [status], properties: { content: { type: string }, status: { type: string, enum: [approved, rejected, generated] } } } } } }
+      responses: { "204": { $ref: "#/components/responses/NoContent" } }
+
+  # ─── Inbox / replies ────────────────────────────────
+  /inbox:
+    parameters:
+      - { $ref: "#/components/parameters/Org" }
+      - { name: classification, in: query, schema: { type: string } }
+      - { name: status, in: query, schema: { type: string, enum: [new, handled, archived] } }
+      - { name: kind, in: query, schema: { type: string, enum: [reply, auto_reply, bounce] } }
+      - { $ref: "#/components/parameters/Page" }
+      - { $ref: "#/components/parameters/PerPage" }
+    get: { tags: [Inbox], summary: "Replies matched to campaign emails (viewer)", responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/InboundMessage" } } } } } } }
+  /inbox/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    patch:
+      tags: [Inbox]
+      summary: Set status and/or reclassify (member). Reclassifying to unsubscribe/spam suppresses the sender.
+      requestBody: { content: { application/json: { schema: { type: object, properties: { status: { type: string, enum: [new, handled, archived] }, classification: { type: string } } } } } }
+      responses: { "204": { $ref: "#/components/responses/NoContent" } }
+  /mailboxes/{id}/sync:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post: { tags: [Inbox], summary: "Sync this mailbox's inbox now (member; inbox sync must be on)", responses: { "202": { description: Queued } } }
+  /mailboxes/{id}/test:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post: { tags: [Mailboxes], summary: "Test SMTP and IMAP credentials without sending (admin)", responses: { "200": { description: "{smtp, imap} — ok or failed: reason" } } }
+  /webhooks/inbound/generic:
+    post:
+      tags: [Inbox]
+      security: []
+      summary: Forward a raw inbound email from your provider's inbound routing
+      description: Signed like the delivery webhook (X-Webhook-Signature = hex HMAC-SHA256 of the body with WEBHOOK_SECRET). The receiving mailbox address selects the organization. Messages that don't answer a campaign email are ignored and not stored.
+      parameters: [{ name: X-Webhook-Signature, in: header, required: true, schema: { type: string } }]
+      requestBody: { content: { application/json: { schema: { type: object, required: [mailbox_email, raw], properties: { mailbox_email: { type: string }, raw: { type: string, contentEncoding: base64, description: RFC 5322 message } } } } } }
+      responses: { "200": { description: "{stored, kind, classification, reason}" } }
+
+  # ─── CRM ────────────────────────────────────────────
+  /crm/pipeline:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { name: owner, in: query, schema: { type: string }, description: "me or a user id" }]
+    get: { tags: [CRM], summary: "Board columns (replied → won/lost) with counts and recent leads (viewer)", responses: { "200": { description: OK } } }
+  /crm/assign:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    post:
+      tags: [CRM]
+      summary: Set (or clear, with null) the owner of leads (member)
+      requestBody: { content: { application/json: { schema: { type: object, properties: { lead_ids: { type: array, items: { type: string, format: uuid } }, owner_id: { type: [string, "null"], format: uuid } } } } } }
+      responses: { "200": { description: "{affected}" } }
+  /crm/sync:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    post:
+      tags: [CRM]
+      summary: Push leads to HubSpot as company + contact (member; up to 1,000)
+      requestBody: { content: { application/json: { schema: { type: object, properties: { lead_ids: { type: array, items: { type: string, format: uuid } } } } } } }
+      responses: { "202": { description: Queued }, "409": { description: HubSpot not connected } }
+  /leads/{id}/notes:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [CRM], responses: { "200": { description: OK } } }
+    post:
+      tags: [CRM]
+      requestBody: { content: { application/json: { schema: { type: object, required: [body], properties: { body: { type: string } } } } } }
+      responses: { "201": { description: Created } }
+  /notes/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    delete: { tags: [CRM], summary: "Delete own note (admins: any)", responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /tasks:
+    parameters:
+      - { $ref: "#/components/parameters/Org" }
+      - { name: assignee, in: query, schema: { type: string }, description: "me or a user id" }
+      - { name: lead_id, in: query, schema: { type: string, format: uuid } }
+      - { name: status, in: query, schema: { type: string, enum: [open, done] } }
+    get: { tags: [CRM], responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Task" } } } } } } }
+    post:
+      tags: [CRM]
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/TaskInput" } } } }
+      responses: { "201": { description: "{id}" } }
+  /tasks/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [CRM]
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/TaskInput" } } } }
+      responses: { "204": { $ref: "#/components/responses/NoContent" } }
+    delete: { tags: [CRM], responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+
+  # ─── Scoring automation & advanced analytics ────────
+  /scoring/suggestions:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Scoring], summary: "Rules learned from outcomes: segments converting much better/worse than average (viewer)", responses: { "200": { description: OK } } }
+  /analytics/leads:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    post:
+      tags: [Analytics]
+      summary: "Lead insights under a filter (industry, city, state, country, source, tags, status, website quality, founded year, size, score, ICP fit, has email/phone/website, created range): totals, breakdowns per dimension, pipeline stages, trend, and a comparison table for compare_by (viewer)"
+      requestBody: { content: { application/json: { schema: { type: object, properties: { filter: { type: object }, compare_by: { type: string }, top: { type: integer } } } } } }
+      responses: { "200": { description: OK } }
+  /analytics/leads/steps:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    post:
+      tags: [Analytics]
+      summary: "Step-by-step filter counts: total leads (step 0) and the leads left after each cumulative step (viewer)"
+      requestBody: { content: { application/json: { schema: { type: object, properties: { steps: { type: array, maxItems: 12, items: { type: object } } } } } } }
+      responses: { "200": { description: "[{step, count}]" } }
+  /auth/verify-email/send:
+    post: { tags: [Onboarding], security: [{ bearer: [] }], summary: "Email a fresh 6-digit verification code (expires in 15 min; one per 60 s)", responses: { "200": { description: Sent }, "409": { description: "Already verified or resend too soon" } } }
+  /auth/verify-email:
+    post:
+      tags: [Onboarding]
+      security: [{ bearer: [] }]
+      summary: "Verify the signed-in user's email with the emailed code (5 attempts per code)"
+      requestBody: { content: { application/json: { schema: { type: object, required: [code], properties: { code: { type: string } } } } } }
+      responses: { "200": { description: "{verified: true}" }, "400": { description: Wrong, expired or exhausted code } }
+  /onboarding:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Onboarding], summary: "Setup wizard state, organization profile and the getting-started checklist computed from real data (viewer)", responses: { "200": { description: OK } } }
+    put: { tags: [Onboarding], summary: "Merge setup wizard progress/answers into the organization's onboarding state (admin)", responses: { "200": { description: OK } } }
+  /invitations:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Onboarding], summary: "Invitations of the organization with status pending/accepted/expired (admin)", responses: { "200": { description: OK } } }
+    post:
+      tags: [Onboarding]
+      summary: "Email invitations (up to 20) with a role; re-inviting replaces the pending link; inviter must be verified (admin)"
+      requestBody: { content: { application/json: { schema: { type: object, required: [emails], properties: { emails: { type: array, items: { type: string } }, role: { type: string, enum: [admin, member, viewer] } } } } } }
+      responses: { "200": { description: "{invited, already_members, invalid}" } }
+  /invitations/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    delete: { tags: [Onboarding], summary: "Withdraw a pending invitation (admin)", responses: { "204": { description: Revoked } } }
+  /invitations/lookup:
+    get:
+      tags: [Onboarding]
+      security: []
+      summary: "Public: organization, email, role and inviter for an invitation token (for the invite page)"
+      parameters: [{ name: token, in: query, required: true, schema: { type: string } }]
+      responses: { "200": { description: OK }, "404": { description: Unknown token }, "409": { description: Used, expired or withdrawn } }
+  /invitations/accept:
+    post:
+      tags: [Onboarding]
+      security: [{ bearer: [] }]
+      summary: "Join the inviting organization; the signed-in user's email must match the invitation (also verifies it)"
+      requestBody: { content: { application/json: { schema: { type: object, required: [token], properties: { token: { type: string } } } } } }
+      responses: { "200": { description: "{organization_id}" }, "403": { description: Email mismatch } }
+  /dashboards:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Dashboards], summary: "Custom analytics dashboards (viewer)", responses: { "200": { description: OK } } }
+    post:
+      tags: [Dashboards]
+      summary: "Create a dashboard: name, widgets (ordered layout) and step-by-step filters (member)"
+      requestBody: { content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string }, widgets: { type: array, maxItems: 40, items: { type: object } }, steps: { type: array, maxItems: 12, items: { type: object } } } } } } }
+      responses: { "201": { description: Created } }
+  /dashboards/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Dashboards], summary: "One dashboard (viewer)", responses: { "200": { description: OK }, "404": { description: Not found } } }
+    put: { tags: [Dashboards], summary: "Replace a dashboard's name, widgets and steps (member)", responses: { "200": { description: OK } } }
+    delete: { tags: [Dashboards], summary: "Delete a dashboard (member)", responses: { "204": { description: Deleted } } }
+  /analytics/advanced:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { name: days, in: query, schema: { type: integer, default: 30 } }]
+    get: { tags: [Analytics], summary: "Reply classifications, mailbox performance, segment response rates, step breakdown, median time to reply (viewer)", responses: { "200": { description: OK } } }
+
+  # ─── Deals pipeline & workflows ───────────────
+  /pipelines:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Deals], summary: "Deal pipelines with their stages; a default pipeline is created on first use (viewer)", responses: { "200": { description: OK } } }
+    post:
+      tags: [Deals]
+      summary: "Create a pipeline; stages default to the standard sales stages (admin)"
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/PipelineInput" } } } }
+      responses: { "201": { description: Created }, "422": { description: Needs one open, one Won and one Lost stage } }
+  /pipelines/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [Deals]
+      summary: "Rename and replace stages; stages sent with an id keep it, removed stages must be empty (admin)"
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/PipelineInput" } } } }
+      responses: { "200": { description: OK }, "409": { description: A removed stage still has deals } }
+    delete: { tags: [Deals], summary: "Delete an empty, non-default pipeline (admin)", responses: { "204": { description: Deleted }, "409": { description: Default or in use } } }
+  /deals/board:
+    parameters:
+      - { $ref: "#/components/parameters/Org" }
+      - { name: pipeline_id, in: query, schema: { type: string, format: uuid } }
+      - { name: owner, in: query, description: "A user id or 'me'", schema: { type: string } }
+    get: { tags: [Deals], summary: "Pipeline board: stage columns with deals, count, value and weighted value, plus totals (viewer)", responses: { "200": { description: OK } } }
+  /deals:
+    parameters:
+      - { $ref: "#/components/parameters/Org" }
+      - { name: pipeline_id, in: query, schema: { type: string, format: uuid } }
+      - { name: lead_id, in: query, schema: { type: string, format: uuid } }
+      - { name: owner, in: query, schema: { type: string } }
+      - { name: status, in: query, schema: { type: string, enum: [open, won, lost] } }
+      - { name: q, in: query, schema: { type: string } }
+    get: { tags: [Deals], summary: "List deals (viewer)", responses: { "200": { description: OK } } }
+    post:
+      tags: [Deals]
+      summary: "Create a deal; without a stage it lands in the default pipeline's first stage, without a name it takes the lead's company name (member)"
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/DealInput" } } } }
+      responses: { "201": { description: Created } }
+  /deals/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Deals], summary: "A deal and its timeline: {deal, events} (viewer)", responses: { "200": { description: OK }, "404": { description: Not found } } }
+    put:
+      tags: [Deals]
+      summary: "Edit a deal's name, value, close date, owner and next step (member)"
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/DealInput" } } } }
+      responses: { "200": { description: OK } }
+    delete: { tags: [Deals], summary: "Delete a deal (member)", responses: { "204": { description: Deleted } } }
+  /deals/{id}/move:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post:
+      tags: [Deals]
+      summary: "Move a deal to a stage; Won/Lost close it and update the lead's status, Lost needs a reason (member)"
+      requestBody: { content: { application/json: { schema: { type: object, required: [stage_id], properties: { stage_id: { type: string, format: uuid }, lost_reason: { type: string } } } } } }
+      responses: { "200": { description: OK }, "422": { description: Missing lost reason } }
+  /deals/{id}/notes:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post:
+      tags: [Deals]
+      summary: "Add a note to the deal's timeline (member)"
+      requestBody: { content: { application/json: { schema: { type: object, required: [body], properties: { body: { type: string } } } } } }
+      responses: { "204": { description: Added } }
+  /workflows/meta:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Workflows], summary: "Triggers, condition fields, operators, actions, text variables and lost reasons (viewer)", responses: { "200": { description: OK } } }
+  /workflows/templates:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Workflows], summary: "Ready-made workflows (viewer)", responses: { "200": { description: OK } } }
+  /workflows:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Workflows], summary: "Workflows with run counts (viewer)", responses: { "200": { description: OK } } }
+    post:
+      tags: [Workflows]
+      summary: "Create a workflow, or send only {template} to create one from a template (admin)"
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/WorkflowInput" } } } }
+      responses: { "201": { description: Created }, "422": { description: Invalid trigger, condition or action } }
+  /workflows/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Workflows], summary: "One workflow (viewer)", responses: { "200": { description: OK }, "404": { description: Not found } } }
+    put:
+      tags: [Workflows]
+      summary: "Replace a workflow; a bare {enabled} turns it on or off (admin)"
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/WorkflowInput" } } } }
+      responses: { "200": { description: OK } }
+    delete: { tags: [Workflows], summary: "Delete a workflow and its run history (admin)", responses: { "204": { description: Deleted } } }
+  /workflows/{id}/runs:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }, { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }]
+    get: { tags: [Workflows], summary: "Run history: one row per event, with each action's result (viewer)", responses: { "200": { description: OK } } }
+  /workflows/{id}/test:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post:
+      tags: [Workflows]
+      summary: "Dry run against a lead or deal: which conditions pass and what each action would do; nothing is changed (member)"
+      requestBody: { content: { application/json: { schema: { type: object, properties: { lead_id: { type: string, format: uuid }, deal_id: { type: string, format: uuid }, classification: { type: string } } } } } }
+      responses: { "200": { description: OK } }
+
+  # ─── Integrations, API keys, webhooks ───────────────
+  /integrations:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Integrations], summary: "Connected integrations; meta has the catalog, ai_enabled and encryption_enabled (viewer)", responses: { "200": { description: OK } } }
+  /integrations/{kind}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { name: kind, in: path, required: true, schema: { type: string, enum: [hubspot] } }]
+    put:
+      tags: [Integrations]
+      summary: Connect or update (admin). Requires ENCRYPTION_KEY on the server.
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/IntegrationInput" } } } }
+      responses: { "204": { $ref: "#/components/responses/NoContent" } }
+    delete: { tags: [Integrations], summary: "Disconnect (admin)", responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /integrations/{kind}/test:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { name: kind, in: path, required: true, schema: { type: string } }]
+    post: { tags: [Integrations], summary: "Make a cheap authenticated call to check credentials (admin)", responses: { "200": { description: OK }, "422": { description: Connection failed } } }
+  /api-keys:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [API keys], summary: "List (admin)", responses: { "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/APIKey" } } } } } } }
+    post:
+      tags: [API keys]
+      summary: Create (admin; role cannot exceed your own; API keys cannot create keys)
+      requestBody: { content: { application/json: { schema: { type: object, required: [name, role], properties: { name: { type: string }, role: { type: string, enum: [admin, member, viewer] } } } } } }
+      responses: { "201": { description: Created — includes the plaintext token once, content: { application/json: { schema: { $ref: "#/components/schemas/APIKey" } } } } }
+  /api-keys/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    delete: { tags: [API keys], summary: "Revoke (admin)", responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /webhook-endpoints:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Webhooks], summary: "List endpoints; meta.event_types (admin)", responses: { "200": { description: OK } } }
+    post:
+      tags: [Webhooks]
+      summary: Add an endpoint (admin; https required in production). The signing secret is returned once.
+      requestBody: { content: { application/json: { schema: { type: object, required: [url, events], properties: { url: { type: string }, description: { type: string }, events: { type: array, items: { type: string } } } } } } }
+      responses: { "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/WebhookEndpoint" } } } } }
+  /webhook-endpoints/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    put:
+      tags: [Webhooks]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { url: { type: string }, description: { type: string }, events: { type: array, items: { type: string } }, active: { type: boolean } } } } } }
+      responses: { "204": { $ref: "#/components/responses/NoContent" } }
+    delete: { tags: [Webhooks], responses: { "204": { $ref: "#/components/responses/NoContent" } } }
+  /webhook-endpoints/{id}/test:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    post: { tags: [Webhooks], summary: "Queue a ping event (admin)", responses: { "202": { description: Queued } } }
+  /webhook-endpoints/{id}/deliveries:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    get: { tags: [Webhooks], summary: "Last 100 deliveries with status, HTTP code, attempts and error (admin)", responses: { "200": { description: OK } } }
+
+  # ─── Agency mode ────────────────────────────────────
+  /agency:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    put:
+      tags: [Agency]
+      summary: Turn agency mode on/off (owner)
+      requestBody: { content: { application/json: { schema: { type: object, properties: { enabled: { type: boolean } } } } } }
+      responses: { "204": { $ref: "#/components/responses/NoContent" } }
+  /agency/clients:
+    parameters: [{ $ref: "#/components/parameters/Org" }]
+    get: { tags: [Agency], summary: "Client organizations with a 30-day rollup (viewer)", responses: { "200": { description: OK } } }
+    post:
+      tags: [Agency]
+      summary: Create a client organization (admin)
+      requestBody: { content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: string }, legal_name: { type: string }, physical_address: { type: string }, daily_send_limit: { type: integer } } } } } }
+      responses: { "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Organization" } } } } }
+  /agency/clients/{id}:
+    parameters: [{ $ref: "#/components/parameters/Org" }, { $ref: "#/components/parameters/Id" }]
+    delete: { tags: [Agency], summary: "Delete a client and all its data (agency owner)", responses: { "204": { $ref: "#/components/responses/NoContent" } } }
